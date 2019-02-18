@@ -1,553 +1,812 @@
-//*****************************************************************************
-//
-// MSP432 main.c template - Empty main
-//
-//****************************************************************************
+/*
+ * Lab 7 Assignment: Implements forward/back style rover controls with both tracks reversible at arbitrary PWM settings but controlled together.
+ * Can be either run indefinitely at a specific PWM, or given a setpoint distance which it approaches via PID. 1 Quad encoder (both position and speed), 1 Ultrasound distance sensor (20Hz sensing cycle),
+ *  and 1 ADC input current sensor. Data Gathering Toggleable via 'g'. Includes Live PID Tuning mode which alternates between setpoints on a regular basis while
+ *  allowing modification of Kp, Kd, and Ki.
+ *
+ *  All variables are necessary for a functional implementation are present already;
+ *  search for LOOK_HERE to find relevant variables and TODO to find remaining tasks for the Lab.
+ *  Compiles with 7 anticipated, but irrelevant warnings D:
+ *
+ * PID COMMANDS:
+ * 's#!' sets a new setpoint distance to maintain; # is potentially-multidigit and measured in mm
+ * 'L' enters Live Tuning mode (enables changing Kp/Kd/Ki via live tuning commands, and alternates the setpoint between two setpoints using Timer_A1)
+ * 'u' cycles which K is being tuned between Kp (Red), Kd (green), and Ki (blue)
+ * 'r' current K -= 100 (only while Live Tuning)
+ * 't' current K -= 10  (only while Live Tuning)
+ * 'y' current K -= 1   (only while Live Tuning)
+ * 'i' current K += 1   (only while Live Tuning)
+ * 'o' current K += 10  (only while Live Tuning)
+ * 'p' current K += 100 (only while Live Tuning)
+ *
+ * GENERAL COMMANDS:
+ * 'g' toggles data gathering/printing: See packageDataOntoBuffer for format
+ * 'z' zeroes out the quad encoders
+ *
+ * DIRECT DRIVE COMMANDS:
+ * 'F' sets all 4 motor control signals to full PWM, forward, indefinitely (100% duty cycle PWM)
+ * 'x' stops all 4 motor control signals, indefinitely (sets them to 0% duty cycle PWM)
+ * 'D+XX!' sets left and right motor control signals to XX% duty cycle PWM, indefinitely.
+ *             '+'s can be '-' to indicate reverse direction as well. XX is 2 digit value, always.
+ *
+ *
+ * All characters are echoed, unrecognized characters aside from /n or /r are replied to with ???
+ *
+ * Uses all available timers on an MSP432 except for Timer32_0
+ *
+ * P5.5 = A0 analog input for Right Front Motor Current
+ * P2.4 to 2.7 = Motor Control PWM signal outputs (2.4 & 2.5 Left, 2.6 & 2.7 Right) (all 4 are same)
+ * P4.1 to P4.4 = Motor direction control outputs (4.1 & 4.2 Left, 4.3 & 4.4 Right) (all 4 are same)
+ * P5.1 & P5.2 = Right Quad Encoder A & B signal inputs (left is ignored)
+ * P6.0 = Ultrasound Distance Sensor Echo (output from HC-SR04, thru voltage divider, Input into 432)
+ * P5.6 = Ultrasound Distance Sensor Trigger (output from 432, input into HC-SR04)
+ */
 
-#include "msp.h"
-#include <stdio.h>
 
-void init();
-void initPWM();
-void initEncoder();
-void timer0_0IsrHandler();
-void timer0_NIsrHandler();
-void timer1_0IsrHandler();
-void setPWM(float);     // this will automatically scale it to the min and max values
-void setDIR(uint8_t);   // 1 = positive, 0 = negative (relative to encoder count)
-void initControlLoop();
+/* DriverLib Includes */
+#include <ti/devices/msp432p4xx/driverlib/driverlib.h>
+#include <ti/devices/msp432p4xx/inc/msp.h>
 
-volatile uint16_t uMax;
-volatile uint16_t uMin;
-volatile int16_t pos;
+/* Standard Includes */
+#include <stdint.h>
+#include <stdbool.h>
+#include "printf.h"
 
-volatile int16_t pos_d;
-volatile float error;
-volatile float u;
-volatile int Kp,Kd,Ki;
-volatile float error_i,error_d,error_old;
-volatile float dt;
-volatile int control_type = 10;
-volatile int antiWindup;
-volatile int btnFlag = 0;
+// Comms Vars
+static volatile bool chasing_setpoint, gathering, parsingSetpoint, driveCommand_forward;
+static volatile uint8_t driveCommand_parseIndex;
+static volatile uint16_t parsedValue;
 
-// To Do
-// 1. Serial gain selection
-// 2. Serial ID selection
-// 3. Serial anti-windup selector
-// 4. DONE Add hard stops so flag doesn't break (DO THIS FIRST)
-// 5. Longer usb cable or power from main supply
-// 6. DONE Make flag more visible
-// 7. Set it up on a box
-// 8. Lights in the room
-// Examples
-// 1. P Control
-// 2. PI Control
-// 3. PD Control
-// 4. PID Control (No anti-windup)
-// 5. Anti-windup
-// 6. Sampling time and Zero Order Hold
-// 7. Integration Error
-// 8. Uneven sampling times
-// 9.
+// Quad Encoder Vars LOOK_HERE
+static volatile enum enc_state_t{enc_O, enc_A, enc_AB, enc_B} enc_state;
+static volatile uint32_t enc_lastInterruptTime;
+static volatile int32_t enc_lastPulseDuration;
+static volatile int32_t enc_curspeed; // Tells us instantaneous angular velocity; sign = direction, magnitude = 1/(Timer32 pulses that past since last quad encoder interrupt)
+static volatile int32_t enc_val; // Tells us encoder position.
 
-void main(void)
+// Distance Sensor Vars LOOK_HERE
+#define DISTANCE_SLOPE_RISE 279 //Calibrate to your own sensor! See Port6 IRQH to see how these are used.
+#define DISTANCE_SLOPE_RUN 208
+#define DISTANCE_OFFSET -208
+static volatile uint16_t distance_mm; //from distance sensor output
+static volatile uint16_t distance_riseTimestamp; //for measuring Echo signal high time
+static volatile uint16_t distance_highTime; //from Echo signal; used to calibrate our sensor interpretation easily
+static const float distance_filter_factor=0.5; //for part two
+
+// PID Controller Variables LOOK_HERE
+#define INITIAL_KP 0
+#define INITIAL_KD 0
+#define INITIAL_KI 0
+static volatile int16_t k_p, k_d, k_i, error, PWM;
+static volatile float integrator_val; // I term value, updated whenever PID control signal updates
+static volatile float proportional_val; // P term
+static volatile float differential_val; // D term
+static volatile float PreSatOut; // pre-saturated output
+static volatile float distance_mm_intoPI; // output of distance-sensor-filter for part 2, is just distance_mm in part 1
+static volatile uint16_t setpoint; // the goal or target
+static const float i_decay_rate=0.5; //for the i term's decay //TODO: tune, up to you
+static const float control_pwm_scaling=100.0; //to convert control signal into a PWM setting // TODO: tune, up to you
+
+// Live-Tuning Vars LOOK_Here (automatically toggles between two setpoints on a timer, while allowing you to modify your KP KI KD values
+static volatile enum tuning_whichK_t{tuning_Kp, tuning_Kd, tuning_Ki} tuning_whichK;
+static volatile bool tuning_mode;
+static volatile uint16_t tuning_AlternateSetpoint; //(specifies which target you're not approaching; currently approaching setpoint (defined above))
+#define TUNING_SETPOINT_A 300 // TODO Choose livetuning setpoints that make sense for your available space
+#define TUNING_SETPOINT_B 600
+#define TUNING_TIME_PER_STEP 5 //in seconds, max is 32sec.
+
+// Current Measurement Vars
+static volatile int16_t current;
+
+// Circular Buffer & Data Packets
+typedef struct {
+    uint32_t timeStamp;
+    int32_t encPos;
+    int32_t encCurSpeed;
+    uint16_t distance_mm;
+    uint16_t current;
+    int16_t pwm;
+} packet_t;
+
+#define BUFF_LENGTH 100
+volatile packet_t circBuff[BUFF_LENGTH];
+volatile uint8_t index_WriteNext;
+volatile uint8_t index_TransmitNext;
+
+// 115200 Baud rate UART on EUSCI_A0
+const eUSCI_UART_Config uartConfig =
 {
-    WDTCTL = WDTPW | WDTHOLD;           // Stop watchdog timer
-	init();
-	while(1)
-	{
-		if(btnFlag == 1)
-		{
-			int i;
-			for(i=0; i<20000; i++) // Debouncing delay
-			{
-				if(1) btnFlag = 1;
-			}
-			btnFlag = 0;
-		}
-	}
+        EUSCI_A_UART_CLOCKSOURCE_SMCLK,          // SMCLK Clock Source
+        8,                                     // BRDIV = 6
+        11,                                       // UCxBRF = 8
+        0,                                       // UCxBRS = 32
+        EUSCI_A_UART_NO_PARITY,                  // No Parity
+        EUSCI_A_UART_LSB_FIRST,                  // LSB First
+        EUSCI_A_UART_ONE_STOP_BIT,               // One stop bit
+        EUSCI_A_UART_MODE,                       // UART mode
+        EUSCI_A_UART_OVERSAMPLING_BAUDRATE_GENERATION  // Oversampling
+};
+
+void configClocks(){
+     CS_setDCOFrequency(16000000);
+     CS_initClockSignal(CS_MCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_1);
+     CS_initClockSignal(CS_SMCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_1);
+     CS_setReferenceOscillatorFrequency(CS_REFO_128KHZ);
+     CS_initClockSignal(CS_ACLK, CS_REFOCLK_SELECT, CS_CLOCK_DIVIDER_1);
 }
 
-void init()
-{
-	//printf("\n");
-	// P1.0 is the LED
-	// P1.4 is the switch
-	P1DIR  = BIT0;  // Port 1.0 is an output;
-	P1DIR &= ~BIT4; // Port 1.4 is an input;
-	P1REN |=  BIT4; // Enabling pull up/down resistors on switch
-	P1OUT &= ~BIT4; // Pulldown resistor selected
-	P1OUT &= ~BIT0; // Pin 0 LOW by default
-
-	// P2.4 is the PWM pin
-	// P2.6 is the BRAKE pin
-	// P2.7 is the DIRECTION pin
-	P2DIR = BIT4 | BIT6 | BIT7;  // Port 2.4, 2.6, and 2.7 are all outputs to drive the motor
-	P2OUT = 0x00;  // All pins LOW by default
-
-	// P4.1 is channel A of the optical encoder
-	// P4.2 is channel B of the optical encoder
-	P4DIR &= ~BIT0 & ~BIT1; // Pins are inputs
-	P4REN |=  BIT0 | BIT1;  // Pins have pull up/down resistors enabled
-	P4OUT |=  BIT0 | BIT1;  // Pins have pull up resistors
-	P4OUT  =  BIT0;  // LED ON by default
-
-	// P5.5  is the pin connected to the button that changes the control system type when pressed
-	P5DIR &= ~BIT5;   	// Pin is an input pin
-	P5REN |=  BIT5;   	// Pin has pull up/down resistor enabled
-	P5OUT |=  BIT5;   	// Pin has pull up resistor
-	P5IES  = BIT5; 		// Falling edge interrupt
-	NVIC_EnableIRQ(PORT5_IRQn); 	// Enabling the Port 5 interrupt
-	NVIC_SetPriority(PORT5_IRQn,4); // Lowest priority interrupt
-	P5IE   =  BIT5;  	// Enabling interrupt
-
-	// Setting the clock speed to 48 MHz
-	CSKEY = 0x695A;  	 // Unlocking the clock registers
-	CSCTL0 = 0;      	 // reset DCO settings
-	CSCTL0 = DCORSEL_5;  // Setting to 48 MHz
-	CSCTL1 = SELA__REFOCLK | SELS__DCOCLK | SELM__DCOCLK; // ACLK = REFOCLK, SMCLK = MCLK = DCOCLK  (SMCLK is the one used by the PWM timers)
-	CSKEY = 0;			 // Lock registers
-
-	// Encoder Interrupts
-	initEncoder();
-
-	// Initialize PWM
-	initPWM();
-
-	// Initialize PWM
-	initControlLoop();
+uint16_t* currentK(){
+    switch (tuning_whichK) {
+        case tuning_Kp:
+            return &k_p;
+        case tuning_Kd:
+            return &k_d;
+        default: // tuning_Ki:
+            return &k_i;
+    }
 }
 
-void timer0_0IsrHandler()
-{
-	// Timer reached TA0CCR0 value
-	TA0CCTL0 &= ~CCIFG;  // Clearing the interrupt flag
-	TA0CTL   &= ~TAIFG;  // Clear TAIFG flag
-	P2OUT    |= BIT4;    // Set the PWM pin HIGH
-	TA0CCTL1 &= ~CCIFG;  // Clearing the interrupt flag
-	TA0CCTL1 |= CCIE;    // Timer overflowed so reenabling the TA0CCTL1 counter interrupt
+void packageDataOntoBuffer(){
+    //Populate next package
+    volatile packet_t* p = &(circBuff[index_WriteNext]);
+    p->timeStamp = Timer32_getValue(TIMER32_1_BASE);
+    p->encPos = enc_val; // units: # of encoder pulses offset from start point
+    p->encCurSpeed = enc_curspeed; // units: inverse of # of Timer32_1 pulses between most recent two enc interrupts (16000000/256 per second)
+                                         // +/- sign corresponds to direction of rotation; note curspeed varies linearly as wheel spin speed.
+                                    // we can skip converting this to "real" units, like degrees/sec, because all of those are constant linear factors,
+                                    // which we can include into our K_d simply by tuning it like we would have to do anyway.
+    p->distance_mm = distance_mm; // units: interpolated distance in millemeters measured by distance sensor
+    p->current = current; // Raw 14bit ADC reading relative to 0V to 3.3V range;
+                            // current sensor output voltage in Volts correlates 1:1 with relevant motor current in Amps
+
+
+    if(P4->OUT & GPIO_PIN1){ //If Pin 4.1 output is high, aka if Front Left Motor is going Forward:
+        p->pwm = TIMER_A0->CCR[1]; // High time proportion Out of 99; 99/99 corresponds to 100% duty cycle.
+    } else {
+        p->pwm = TIMER_A0->CCR[1]*-1; // High time proportion Out of 99; 99/99 corresponds to 100% duty cycle.
+                                       //Negative PWM indicates reverse direction polarity.
+    }
+
+
+    // Add to buffer
+    index_WriteNext++;
+    index_WriteNext %= BUFF_LENGTH;
 }
 
-void timer0_NIsrHandler()
-{
-	// Reached PWM threshold value
-	if(TA0CCTL1 & CCIFG)
-	{
-		TA0CCTL1 &= ~CCIFG; // Clearing the interrupt flag
-		P2OUT    &= ~BIT4;	// Set PWM pin LOW
-	}
+void configTimerA3PWMForADC(){
+        TIMER_A3->CTL = TIMER_A_CTL_SSEL__ACLK // Sources Timer_A3 from the A Clock ...
+                            | TIMER_A_CTL_ID__1 // ... with an input divider of 1 ...
+                            | TIMER_A_CTL_MC__UP; // accumulating in Up mode (ccr0 stores period)
+
+        TIMER_A3->CCR[0] = 1280; // 100Hz cycle rate
+
+        //Set CCR for Compare mode with Toggle/Set output mode for PWM generation
+        TIMER_A3->CCTL[1] = TIMER_A_CCTLN_OUTMOD_6;
+
+        TIMER_A3->CCR[1]  = 1; //~7us high time
 }
 
-void initPWM()
-{
-	// PWM Timer (TIMER0) setup
-	NVIC_EnableIRQ(TA0_0_IRQn); // Enable interrupts
-	NVIC_EnableIRQ(TA0_N_IRQn);
+void configUART(){
+    UART_initModule(EUSCI_A0_BASE, &uartConfig);
 
-	NVIC_SetPriority(TA0_0_IRQn,2);
-	NVIC_SetPriority(TA0_N_IRQn,2);
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P1,
+                GPIO_PIN2 | GPIO_PIN3, GPIO_PRIMARY_MODULE_FUNCTION);
 
-	// TA0CCTL0, configure the timer for SMCLK, no division, up mode, and clear it now.
-	TA0CTL = TASSEL_2 | ID_0 | MC_1 | TACLR | TAIE;
+    UART_enableModule(EUSCI_A0_BASE);
 
-	// PWM Frequency
-	// TA0CCR0, interrupt value (max is 2^16);
-	TA0CCR0 = 4800;  // 48Mhz/10kHz = 4800 counts to get 10KHz
-	uMax    = TA0CCR0;  // This scales the range of values (and the resolution) of the PWM signal
-
-	int factor = 1;
-	char c = TA0CTL;
-	c &= BIT6 | BIT7;
-
-	switch(c)
-	{
-	case 0x00:
-		factor = 1;
-		break;
-
-	case 0x40:
-		factor = 2;
-		break;
-
-	case 0x80:
-		factor = 4;
-		break;
-
-	case 0xc0:
-		factor = 8;
-		break;
-	}
-	uMin	= uMax*0.019375/(factor)*2; // For some reason, the timer goes nuts if there aren't enough steps
-
-	// Duty Cytle
-	//TA0CCR1 = uMax*0.5;  // Default 50% duty cycle
-	TA0CCR1 = 0;
-	// (240 clock counts, or 5us, are required to set the digital pin in the interrupt handler
-	// so the realistic range is 240 to uMax-240)
-
-	// Enable the timer interrupts
-	TA0CCTL0 = CCIE;
-	TA0CCTL1 = CCIE;
+    UART_enableInterrupt(EUSCI_A0_BASE, EUSCI_A_UART_RECEIVE_INTERRUPT);
+    Interrupt_enableInterrupt(INT_EUSCIA0);
 }
 
-void setPWM(float val)
-{
-	// Rescaling so that it's always a percentage no matter the frequency/count# of TA0CCR0
-	val = val*1.0/65535.0*uMax;
-	//printf("\n%u\t",val);
-	//printf("%f\t",v);
-	//printf("%u\n",uMin);
-	if(val < uMin) val = uMin;
-	if(val > uMax) val = uMax;
-	TA0CCR1 = val;
+void configADC(){
+    ADC14->CTL0 = 0; //disables module first, so that it can be reconfigured
+    ADC14->CTL0 = ADC14_CTL0_ON | // turns on ADC
+            ADC14_CTL0_CONSEQ_3 | // sequence of sources, repeat sample mode
+            ADC14_CTL0_SSEL__SMCLK | //ADC clock sourced from SM clock...
+            ADC14_CTL0_DIV__1 | //with divider 1 ...
+            ADC14_CTL0_PDIV__1 | //and predivider 1.
+            ADC14_CTL0_SHS_7; //Sample-And-Hold (SHI) Signal sourced from TA3 CCR1's output
+
+
+    ADC14->CTL1 = ADC14_CTL1_RES__14BIT | //14bit resolution
+            (0 << ADC14_CTL1_CSTARTADD_OFS); //samples starting at ADCMEM[0]
+
+    ADC14->MCTL[0] = ADC14_MCTLN_INCH_0 | //A0 sample/converts into ADCMEM[0] FOR RIGHT MOTOR CURRENTS
+            ADC14_MCTLN_EOS | //ADCMEM[0] is the last in the sequence
+            ADC14_MCTLN_VRSEL_0; //using reference voltages of ground and 3.3V
+
+    ADC14->CLRIFGR0 = ADC14_IER0_IE0; // Clears interrupt flag to avoid spurious interrupt
+    ADC14->IER0 = ADC14_IER0_IE0; //Enables interrupt from ADCMEM[1] finishing conversion.
+
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P5, GPIO_PIN5, GPIO_TERTIARY_MODULE_FUNCTION);
+    //A0 is analog input on P5.5
+
+    Interrupt_enableInterrupt(INT_ADC14);
+}
+//Configures Timer_A1 for use in Live Tuning mode as the regularly occuring 5second timer
+void configTA1forLiveTuning(){
+    TIMER_A1->CTL = TIMER_A_CTL_SSEL__ACLK //Sourced from AClock
+                    | TIMER_A_CTL_ID__8 // input divider of 8
+                    | TIMER_A_CTL_CLR //Clear interrupts
+                    | TIMER_A_CTL_IE; // enable interrupt
+
+    TIMER_A1->EX0 = TIMER_A_EX0_IDEX__8; //cumulative predivider of 64; counts at 2000 pulses per second
+
+    TIMER_A1->CCTL[0] = TIMER_A_CCTLN_CCIE; // Enables CCR0's Interrupt (For TA2_0 interrupt)
+    TIMER_A1->CCR[0] = TUNING_TIME_PER_STEP * 2000; // interrupt every [insert number from define] seconds
+
+    Interrupt_enableInterrupt(INT_TA1_0);
+
+    tuning_mode = false;
+    GPIO_setAsOutputPin(GPIO_PORT_P2, GPIO_PIN0 | GPIO_PIN1 | GPIO_PIN2);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN0 | GPIO_PIN1 | GPIO_PIN2);
+    tuning_whichK = tuning_Kp;
+    //LOOK_HERE XD
+    k_p = INITIAL_KP;
+    k_d = INITIAL_KD;
+    k_i = INITIAL_KI;
 }
 
-void setDIR(uint8_t val)
-{
-	if(val == 0)
-	{
-		P2OUT |= BIT7;
-	}
-	else
-	{
-		P2OUT &= ~BIT7;
-	}
+// Configures Timer_A2 to both trigger the pulsing of and time the output from the Ultrasound distance sensor.
+// Actual time sampling draws from GPIO input interrupts on P6.0, in contrast to lecture.
+// Measures distance at 20Hz update cycle; triggers Timer_A2 CCR0's interrupt (TA2_0_IRQHandler, not TA2_N_IRQHandler) for transmission
+void configTA2andGPIOsForUltrasoundDistSensor(){
+    TIMER_A2->CTL = TIMER_A_CTL_SSEL__ACLK // Sources Timer_A2 from the A Clock ...
+                    | TIMER_A_CTL_ID__1 // ... with an input divider of 1 ...
+                    | TIMER_A_CTL_CLR // Clear Timer_A2 interrupt flag to avoid spurious interrupts
+                    | TIMER_A_CTL_IE    // enable Timer_A2's Interrupts at all
+                    | TIMER_A_CTL_MC__UP; // accumulating in Up mode (ccr0 stores period)
+
+    TIMER_A2->CCTL[0] = TIMER_A_CCTLN_CCIE; // Enables CCR0's Interrupt (For TA2_0 interrupt)
+    TIMER_A2->CCR[0] = 6400; // 20Hz cycle rate
+
+    //Set CCR for Compare mode with Toggle/Set output mode for PWM generation
+    TIMER_A2->CCTL[1] = TIMER_A_CCTLN_OUTMOD_6;
+    TIMER_A2->CCR[1]  = 2; //15.625us high time (for >=10us high time TRIGGER line)
+
+    Interrupt_enableInterrupt(INT_TA2_0);
+
+    distance_mm = 0;
+    distance_riseTimestamp = 0;
+
+    GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P5, GPIO_PIN6, GPIO_PRIMARY_MODULE_FUNCTION);
+
+    // Reading the Echo via GPIO pin 6.0
+    GPIO_setAsInputPin(GPIO_PORT_P6, GPIO_PIN0); //no pullup/pulldown resistor needed; signal output from distance sensor
+    GPIO_interruptEdgeSelect(GPIO_PORT_P6, GPIO_PIN0, GPIO_LOW_TO_HIGH_TRANSITION); // watching for rising edge
+    GPIO_enableInterrupt(GPIO_PORT_P6, GPIO_PIN0);
+    Interrupt_enableInterrupt(INT_PORT6);
 }
 
-void initEncoder()
-{
-	// Setting the rising or falling edge bits based on if the pin is high or low at this mooment.
-	P4IES = 0x00;
-	if(P4IN & BIT1)
-	{
-		P4IES  |=  BIT1;
-	}
-
-	if(P4IN & BIT2)
-	{
-		P4IES  |=  BIT2;
-	}
-
-	P4IFG &= ~BIT1 & ~BIT2; // Clearing interrupt flags
-	P4IE   =  BIT1 | BIT2;  // Enabling interrutps
-	NVIC_EnableIRQ(PORT4_IRQn);
-	NVIC_SetPriority(PORT4_IRQn,0);
-	pos = 0;
+// Sets GPIO pins Outputs, defaults to low
+void configGPIOOutput(uint_fast8_t port, uint_fast16_t pins){
+    GPIO_setAsOutputPin(port, pins);
+    GPIO_setOutputLowOnPin(port, pins);
 }
 
-void encoderISR()
-{
-	short val = 0;
-	val = P4IN;
-	if(P4IFG & BIT1)  // A
-	{
-		if(P4IES & BIT1) // Falling edge
-		{
-			if(val & BIT2) // B is HIGH
-			{
-				pos++;
-			}
-			else
-			{
-				pos--;
-			}
-		}
-		else // Rising edge
-		{
-			if(val & BIT2) // B is HIGH
-			{
-				pos--;
-			}
-			else
-			{
-				pos++;
-			}
-		}
-		P4IES = P4IES ^ BIT1;
-	}
-	if(P4IFG & BIT2)  // B
-	{
-		if(P4IES & BIT2) // Falling edge
-		{
-			if(val & BIT1) // A is HIGH
-			{
-				pos--;
-			}
-			else
-			{
-				pos++;
-			}
-		}
-		else // Rising edge
-		{
-			if(val & BIT1) // A is HIGH
-			{
-				pos++;
-			}
-			else
-			{
-				pos--;
-			}
-		}
-		P4IES = P4IES ^ BIT2;
-	}
-	if(pos >  2048)  pos = pos - 4096;
-	if(pos < -2048)  pos = pos + 4096;
-	P4IFG = 0;
-	//printf("Encoder moved!\n");
+void configTA0forMotorPWM(){
+    TIMER_A0->CTL = TIMER_A_CTL_SSEL__SMCLK // Sources Timer_A0 from the SM Clock ...
+                        | TIMER_A_CTL_ID__8 // ... with an input divider of 8 ...
+                        | TIMER_A_CTL_MC__UP; // accumulating in Up mode (ccr0 stores period)
+
+    TIMER_A0->EX0 = TIMER_A_EX0_IDEX__8; // additional predivider of 8 (64x reduction total) LOOK_HERE
+
+    TIMER_A0->CCR[0] = 99; // 2.5kHz PWM cycle rate
+
+    //Set CCR for Compare mode with Toggle/Set output mode for PWM generation
+    TIMER_A0->CCTL[1] = TIMER_A_CCTLN_OUTMOD_6;
+    TIMER_A0->CCTL[2] = TIMER_A_CCTLN_OUTMOD_6;
+    TIMER_A0->CCTL[3] = TIMER_A_CCTLN_OUTMOD_6;
+    TIMER_A0->CCTL[4] = TIMER_A_CCTLN_OUTMOD_6;
+
+    TIMER_A0->CCR[1]  = 0; //0% duty cycle by default
+    TIMER_A0->CCR[2]  = 0; //0% duty cycle by default
+    TIMER_A0->CCR[3]  = 0; //0% duty cycle by default
+    TIMER_A0->CCR[4]  = 0; //0% duty cycle by default
+
+
+    GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P2, GPIO_PIN4 | GPIO_PIN5 | GPIO_PIN6 | GPIO_PIN7, GPIO_PRIMARY_MODULE_FUNCTION);
 }
 
-void buttonISR()
-{
-	if((P5IFG & BIT5) && btnFlag == 0) // P5.5 interrupt was triggered and the debouncing loop has finished
-	{
-		TA1CCTL0 &= ~CCIE;  // Disabling the control loop timer
-		//NVIC_DisableIRQ(TA1_0_IRQn);      // disable the control loop timer interrupts
-		control_type++;
-		if(control_type > 10)
-		{
-			control_type = 0;
-		}
-		initControlLoop();
-		btnFlag = 1;
-	}
-//	if(P1OUT & BIT0)
-//	{
-//		P1OUT &= ~BIT0;  // LED Toggle
-//	}
-//	else
-//	{
-//		P1OUT |= BIT0; // LED Toggle
-//	}
-	//printf("%s","Button ISR");
-	P5IFG &= ~BIT5; // Clearing interrupt flag
+// Configures the following pins as inputs & initializes relevant state & interrupt edge direction
+// P5.1 & P5.2 = Right Quad Encoder A & B signal inputs
+void configEncoderGPIOInputs(){
+    GPIO_setAsInputPin(GPIO_PORT_P5, GPIO_PIN1 | GPIO_PIN2);
+
+    GPIO_enableInterrupt(GPIO_PORT_P5, GPIO_PIN1 | GPIO_PIN2);
+
+    Interrupt_enableInterrupt(INT_PORT5);
+    //No Pull-up or Pull-down resistor needed as input wire voltage is always clearly defined (output from encoder)
+    uint8_t initvals = GPIO_getInputPinValue(GPIO_PORT_P5, GPIO_PIN1 | GPIO_PIN2);
+    switch (initvals) {
+        case 0b00000000:
+            enc_state = enc_O;
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1 | GPIO_PIN2, GPIO_LOW_TO_HIGH_TRANSITION);
+            break;
+        case 0b00000010:
+            enc_state = enc_B;
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_LOW_TO_HIGH_TRANSITION);
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_HIGH_TO_LOW_TRANSITION);
+            break;
+        case 0b00000100:
+            enc_state = enc_A;
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_LOW_TO_HIGH_TRANSITION);
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_HIGH_TO_LOW_TRANSITION);
+            break;
+        case 0b00000110:
+            enc_state = enc_AB;
+            GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1 | GPIO_PIN2, GPIO_HIGH_TO_LOW_TRANSITION);
+            break;
+    }
+
+    // Initialize States:
+    enc_val = 0;
+    enc_lastInterruptTime = Timer32_getValue(TIMER32_1_BASE);
+    enc_curspeed = 0;
 }
 
-void initControlLoop()
+// Configures Timer32_1 as a long-running timer to measure the speed of Quad encoder interrupts
+void configT32_1ForEncoder(){
+    Timer32_initModule(TIMER32_1_BASE, TIMER32_PRESCALER_256, TIMER32_32BIT, TIMER32_FREE_RUN_MODE);
+    // Not bothering to enable Timer32_1's interrupt as rover doesn't operate for long enough for it to run out.
+}
+
+int main(void)
 {
-	u     		= 0;
-	pos_d 		= 0;
-	error 		= 0;
-	error_i 	= 0;
-	error_d 	= 0;
-	error_old 	= 0;
+    WDT_A_holdTimer();
 
-	NVIC_EnableIRQ(TA1_0_IRQn);      // Enable interrupts
-	NVIC_SetPriority(TA1_0_IRQn,3);  // Second highest priority
-	P1OUT &= ~BIT0;  // LED OFF
-	switch(control_type)
-	{
-	case 0:  // P low gain (low stiffness, doesn't oscillate)
-		Kp = 200;
-		Ki = 0;
-		Kd = 0;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n\n","Proportional Control, Kp = ",Kp);
-		break;
-	case 1:  // P best gain (good compromise, used in the next 3 cases)
-		Kp = 500;
-		Ki = 0;
-		Kd = 0;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s\n\n","(control loop running at 100 Hz)");
-		break;
-	case 2:  // P high gain (high stiffness, high oscillations)
-		Kp = 1000;
-		Ki = 0;
-		Kd = 0;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n\n","Proportional Control, Kp = ",Kp);
-		break;
+    //init
+    gathering = true;
+    driveCommand_parseIndex = 0;
+    parsedValue = 0;
+    chasing_setpoint = false;
+
+    // config basics:
+    configClocks();
+
+    //config - motor control
+    configGPIOOutput(GPIO_PORT_P4, GPIO_PIN1 | GPIO_PIN2 | GPIO_PIN3 | GPIO_PIN4);
+    GPIO_setOutputHighOnPin(GPIO_PORT_P4, GPIO_PIN1 | GPIO_PIN2 | GPIO_PIN3 | GPIO_PIN4);
+
+    configTA0forMotorPWM();
+
+    // config comms
+    configUART();
+
+    // config ADC
+    configADC();
+
+    configTimerA3PWMForADC();
+
+    // config Sensors & Encoders
+    configTA2andGPIOsForUltrasoundDistSensor();
+
+    configEncoderGPIOInputs();
+    configT32_1ForEncoder();
+
+    // config live tuning:
+    configTA1forLiveTuning();
+
+    // Setup Circular Buffer
+    index_TransmitNext = 0;
+    index_WriteNext = 0;
+    Interrupt_disableSleepOnIsrExit();
+
+    Timer32_startTimer(TIMER32_1_BASE, 1); // For timing encoder changes & datapoints
+    Timer_A_startCounter(TIMER_A2_BASE, TIMER_A_UP_MODE); // Distance sensor enabled
+    ADC14->CTL0 |= ADC14_CTL0_ENC; // enables sampling/conversion for motor currents
+
+    Interrupt_enableMaster();
+
+    /* Going to sleep */
+    while (1)
+    {
+        //Check if there's packets remaining to be sent:
+        if(index_WriteNext != index_TransmitNext){
+            packet_t p = circBuff[index_TransmitNext];
+            printf(EUSCI_A0_BASE,"%n,%l,%l,%u,%u,%i\n\r",
+                   p.timeStamp, p.encPos, p.encCurSpeed, p.distance_mm, p.current, p.pwm); // takes a while
+            index_TransmitNext++;
+            index_TransmitNext %= BUFF_LENGTH; //wraparound the circular buffer
+        } else {
+            PCM_gotoLPM0InterruptSafe(); // 'Shallowest' Low-Power mode; leaves all peripherals on at full frequency anticipating a relatively-soon wakeup.
+        }
+    }
+}
+
+// Triggered reliably at 20Hz
+void TA2_0_IRQHandler(void){
+    TIMER_A2->CCTL[0] &= ~TIMER_A_CCTLN_CCIFG; // Clears interrupt flag on TA2's CCR0,
+
+    if(!gathering) // dont even package data if not supposed to be gathering
+        return;
+
+    // gather/handle this period's sensor values for transmission
+    packageDataOntoBuffer();
+}
+
+void TA1_0_IRQHandler(void){
+    TIMER_A1->CCTL[0] &= ~TIMER_A_CCTLN_CCIFG;
+
+    uint16_t temp = setpoint;
+    setpoint = tuning_AlternateSetpoint;
+    tuning_AlternateSetpoint = temp;
+}
+
+// sets PWM duty cycle & direction pins for specified constant drive commands like F, x, and DSXX!
+void driveIndefinitely(bool forward, uint16_t PWM){ //LOOK_HERE
+    if(forward){
+        GPIO_setOutputHighOnPin(GPIO_PORT_P4, GPIO_PIN1 | GPIO_PIN2 | GPIO_PIN3 | GPIO_PIN4);
+    } else {
+        GPIO_setOutputLowOnPin(GPIO_PORT_P4, GPIO_PIN1 | GPIO_PIN2 | GPIO_PIN3 | GPIO_PIN4);
+    }
 
 
-	case 3:  // PD
-		Kp = 500;
-		Ki = 0;
-		Kd = 25;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s\n\n","(control loop running at 100 Hz)");
-		break;
+    TIMER_A0->CCR[1] = PWM;
+    TIMER_A0->CCR[2] = PWM;
+    TIMER_A0->CCR[3] = PWM;
+    TIMER_A0->CCR[4] = PWM;
+}
 
-	case 4:  // PI
-		Kp = 400;
-		Ki = 400;
-		Kd = 0;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n","(No antiwindup, control loop running at 100 Hz)");
-		break;
+// TODO: Calculate the PID controller values and output, calculates the new PWM and direction settings, and applies those changes.\
+// Called after any relevant new information has been acquired; left quad encoder interrupts and also new distance sensor values acquired.
 
-	case 5:  // PID (ok gains, no anti-windup)
-		Kp = 500;
-		Ki = 375;
-		Kd = 25;
-		antiWindup = 0;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n","(No antiwindup, control loop running at 100 Hz)");
-		break;
+void updatePIDController(){
 
-	case 6:  // PID with anti-windup
-		Kp = 500;
-		Ki = 375;
-		Kd = 25;
-		antiWindup = 1;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n",  "Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n",  "(Using antiwindup, control loop running at 100 Hz)");
-		break;
+    if(!chasing_setpoint){
+        return;
+    }
+    //TODO: Update this in part two, when you filter your distance sensor's output:
+    distance_mm_intoPI = distance_mm;
 
-	case 7:  // PID super high gains (unstable because slow control loop 100 Hz)
-		Kp 	  		= 10000;
-		Ki    		= 6000;
-		Kd	  		= 350;
-		antiWindup = 1;
-		// TA1CCTL0, configure the timer for SMCLK, /8, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_3 | MC_1 | TACLR | TAIE;
-		dt = 0.01;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n","(Using antiwindup, control loop running at 100 Hz)");
-		break;
+    //Todo: calc P, D, and I terms using the global K constants and relevant global sensor output values
+    error = setpoint - distance_mm_intoPI; /* Compute the error */ \
+    proportional_val = k_p * error; /* Compute P */ \
+    integrator_val = integrator_val + k_i*proportional_val; /* Compute I */ //TODO
+    differential_val = k_d *  enc_curspeed; //TODO
+    PreSatOut = abs((proportional_val + integrator_val + differential_val)*control_pwm_scaling);
 
-	case 8:  // PID super high gains (more stable because control loop a little faster 400 Hz)
-		Kp 	  		= 10000;
-		Ki    		= 6000;
-		Kd	  		= 350;
-		antiWindup = 1;
-		// TA1CCTL0, configure the timer for SMCLK, /2, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_2 | MC_1 | TACLR | TAIE;
-		dt = 0.0025;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n","(Using antiwindup, control loop running at 400 Hz)");
-		break;
+    // TODO Set Motor Direction Pins (4.1 & 4.2 left, 4.3 & 4.4 right) to match the control signal's sign
+    // Set PWM Duty Cycles (percentages) as a saturating linear transformation of your control signal outputs
 
-	case 9:  // PID super high gains (stable because control loop is much faster 800 Hz)
-		Kp 	  		= 10000;
-		Ki    		= 6000;
-		Kd	  		= 350;
-		antiWindup = 1;
-		// TA1CCTL0, configure the timer for SMCLK, /0, up mode, and clear it now.
-		TA1CTL = TASSEL_2 | ID_0 | MC_1 | TACLR | TAIE;
-		dt = 0.00125;
-		//printf("%s%d\n","Proportional Control, Kp = ",Kp);
-		//printf("%s%d\n","Derivative Control,   Kd = ",Kd);
-		//printf("%s%d\n","Integral Control,     Ki = ",Ki);
-		//printf("%s\n\n","(Using antiwindup, control loop running at 800 Hz)");
-		break;
+    if (PreSatOut > 100) /* Saturate output */ \
+    {PWM = 100;} \
+    else if (PreSatOut < 20)
+    {PWM = 20;}
+    else
+    {PWM = PreSatOut;}
 
-	default:
-		// Turning the PWM signal off;
-		setPWM(0);
-
-		// control loop off, LED on
-		P1OUT |= BIT0;
-
-		// Disable the timer interrupts
-		TA1CCTL0 |= !CCIE;
-
-		//printf("%s\n","Controller off.  Press and hold the button to cycle through the different control schemes.");
-		break;
-	}
-
-	// Set the timer count value
-	TA1CCR0 = 48000;  // 48Mhz/4/60kHz = 200 hz control loop (8 is the clock divider ID_0,1,2,3, etc.)
-
-	if(control_type <= 9)
-	{
-		// Enable the timer interrupts
-		TA1CCTL0 = CCIE;
-	}
-
-	//printf("%s%d\n","Pos=",pos);
-	//printf("%s%d\n","Type=",control_type);
+    if(error>>0)// go backwards
+        driveIndefinitely(false,PWM);
+    else
+        driveIndefinitely(true, PWM);
 
 }
 
-void timer1_0IsrHandler()
+void PORT6_IRQHandler(){
+
+    uint_fast16_t status = GPIO_getEnabledInterruptStatus(GPIO_PORT_P6);
+    GPIO_clearInterruptFlag(GPIO_PORT_P6, status);
+
+    //Record Timer_A2 value on both ends of the sensor's output pulse, for later transmission
+    if(status & GPIO_PIN0){
+        if(distance_riseTimestamp == 0){ // we haven't seen the rising edge yet this cycle
+            distance_riseTimestamp = TIMER_A2->R; // Record current timestamp of timerA
+            GPIO_interruptEdgeSelect(GPIO_PORT_P6, GPIO_PIN0, GPIO_HIGH_TO_LOW_TRANSITION); // watch for falling edge
+        } else {// already saw the rising edge, this is falling edge
+            uint16_t curtime = TIMER_A2->R;
+            //distance_mm = (curtime - distance_riseTimestamp)/128/10^6*340/2 // this is in mm/ms, because TIMER_A2 is sourced from 128kHz Aclock
+            distance_highTime = (curtime - distance_riseTimestamp);
+            distance_mm = DISTANCE_SLOPE_RISE * (distance_highTime - DISTANCE_OFFSET) / DISTANCE_SLOPE_RUN; //LOOK_HERE
+
+            // set up for next distance reading
+            distance_riseTimestamp = 0;
+            GPIO_interruptEdgeSelect(GPIO_PORT_P6, GPIO_PIN0, GPIO_LOW_TO_HIGH_TRANSITION);
+
+            //LOOK_HERE (updates the P and I terms, off of the new distance value)
+            updatePIDController();
+        }
+    }
+}
+
+// For Right Quad Encoder
+void PORT5_IRQHandler(){
+    uint_fast16_t status = GPIO_getEnabledInterruptStatus(GPIO_PORT_P5);
+    GPIO_clearInterruptFlag(GPIO_PORT_P5, status);
+
+    if(status & GPIO_PIN1){ //Interrupt on A
+        uint32_t curtime = Timer32_getValue(TIMER32_1_BASE);
+
+        switch (enc_state) {
+            case enc_O: //00 to 10 Transition
+                enc_val++;
+                enc_curspeed = INT32_MAX / (enc_lastInterruptTime - curtime);
+                enc_state = enc_A;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_HIGH_TO_LOW_TRANSITION);
+                break;
+            case enc_A: //10 to 00 Transition
+                enc_val--;
+                enc_curspeed = INT32_MAX / (-1 * (enc_lastInterruptTime - curtime));
+                enc_state = enc_O;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_LOW_TO_HIGH_TRANSITION);
+                break;
+            case enc_AB: //11 to 01 Transition
+                enc_val++;
+                enc_curspeed = INT32_MAX / (enc_lastInterruptTime - curtime);
+                enc_state = enc_B;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_LOW_TO_HIGH_TRANSITION);
+                break;
+            case enc_B: //01 to 11 Transition
+                enc_val--;
+                enc_curspeed = INT32_MAX / (-1 *(enc_lastInterruptTime - curtime));
+                enc_state = enc_AB;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN1, GPIO_HIGH_TO_LOW_TRANSITION);
+                break;
+        }
+        enc_lastInterruptTime = curtime;
+    }
+    if(status & GPIO_PIN2){ //Interrupt on B
+        uint32_t curtime = Timer32_getValue(TIMER32_1_BASE);
+
+        switch (enc_state) {
+            case enc_O: //00 to 01 Transition
+                enc_val--;
+                enc_curspeed = INT32_MAX / (-1 * (enc_lastInterruptTime - curtime));
+                enc_state = enc_B;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_HIGH_TO_LOW_TRANSITION);
+                break;
+            case enc_A: //10 to 11 Transition
+                enc_val++;
+                enc_curspeed = INT32_MAX / (enc_lastInterruptTime - curtime);
+                enc_state = enc_AB;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_HIGH_TO_LOW_TRANSITION);
+                break;
+            case enc_AB: //11 to 10 Transition
+                enc_val--;
+                enc_curspeed = INT32_MAX / (-1*(enc_lastInterruptTime - curtime));
+                enc_state = enc_A;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_LOW_TO_HIGH_TRANSITION);
+                break;
+            case enc_B: //01 to 00 Transition
+                enc_val++;
+                enc_curspeed = INT32_MAX / (enc_lastInterruptTime - curtime) ;
+                enc_state = enc_O;
+                GPIO_interruptEdgeSelect(GPIO_PORT_P5, GPIO_PIN2, GPIO_LOW_TO_HIGH_TRANSITION);
+                break;
+        }
+        enc_lastInterruptTime = curtime;
+    }
+    updatePIDController();
+}
+
+void EUSCIA0_IRQHandler(void){
+    uint32_t status = UART_getEnabledInterruptStatus(EUSCI_A0_BASE);
+    UART_clearInterruptFlag(EUSCI_A0_BASE, status);
+
+    if(status & EUSCI_A_IFG_RXIFG){
+        char readchar = UART_receiveData(EUSCI_A0_BASE);
+
+        if(!tuning_mode || readchar == 'L'){ //Avoid disrupting Matlab parsing during live tuning
+            printf(EUSCI_A0_BASE, "%c", readchar);
+        }
+        bool invalidCommand = true;
+
+        // Drive command parsing: DSXX!
+        switch(driveCommand_parseIndex){
+        case 0:
+            // Haven't received 'D' yet => not in Drive command yet
+            break;
+        case 1:
+            //Anticipating '+' or '-' to indicate direction of motors
+            if(readchar == '+'){
+                invalidCommand = false;
+                driveCommand_parseIndex++;
+                driveCommand_forward = true;
+            } else if(readchar == '-'){
+                invalidCommand = false;
+                driveCommand_parseIndex++;
+                driveCommand_forward = false;
+            } else{
+                driveCommand_parseIndex = 0;
+                printf(EUSCI_A0_BASE,"Invalid command.\n\r");
+            }
+            parsedValue = 0;
+            break;
+        case 2:
+        case 3:
+            //accumulating the PWM value for left side; 2 numeric digits expected
+            if(readchar >= '0' && readchar <= '9'){
+                int16_t newdigit = readchar - '0';
+                parsedValue = parsedValue * 10 + newdigit;
+                invalidCommand = false;
+                driveCommand_parseIndex++;
+            } else {
+                driveCommand_parseIndex = 0;
+                printf(EUSCI_A0_BASE,"Invalid command.\n\r");
+            }
+            break;
+        case 4:
+            //  awaiting ! (indicating an indefinite drive command, executed now)
+            // all else is invalid
+            if(readchar == '!'){
+                invalidCommand = false;
+                driveCommand_parseIndex = 0;
+                driveIndefinitely(driveCommand_forward, parsedValue);
+                printf(EUSCI_A0_BASE, "Driving at %i%% duty cycle.\n\r",
+                       (driveCommand_forward ? parsedValue : -1 * parsedValue));
+            } else{
+                driveCommand_parseIndex = 0;
+                printf(EUSCI_A0_BASE,"Invalid command.\n\r");
+            }
+            break;
+        }
+
+        // Setpoint Parsing:
+        // Format: s#!, potentially-multidigit positive numeral
+        if(parsingSetpoint){
+            if(readchar >= '0' && readchar <= '9'){
+                int16_t newdigit = readchar - '0';
+                parsedValue = parsedValue * 10 + newdigit;
+                invalidCommand = false;
+            } else if(readchar == '!'){
+                invalidCommand = false;
+                parsingSetpoint = false;
+                setpoint = parsedValue;
+                printf(EUSCI_A0_BASE, "Set: %u\n\r",setpoint);
+                chasing_setpoint = true;
+            } else {
+                parsingSetpoint = false;
+                printf(EUSCI_A0_BASE,"Invalid command.\n\r");
+            }
+        }
+
+        // Command First Character Parsing
+        switch(readchar){
+        case 'g':
+            if(gathering){
+                gathering = false;
+                printf(EUSCI_A0_BASE, "Data Gathering Paused.\n\r");
+            } else {
+                gathering = true;
+            }
+            invalidCommand = false;
+            break;
+        case 'z':
+            enc_val=0;
+            printf(EUSCI_A0_BASE,"Zeroed.\n\r");
+        case 's':
+            parsingSetpoint = true;
+            parsedValue = 0;
+            invalidCommand = false;
+            break;
+        case 'F':
+            driveIndefinitely(true, 100); // Full speed, forward.
+            printf(EUSCI_A0_BASE, "Driving at 100%% duty cycle.\n\r");
+            invalidCommand = false;
+            chasing_setpoint = false;
+            break;
+        case 'x':
+            driveIndefinitely(true, 0); //Stop.
+            printf(EUSCI_A0_BASE, "Halting.\n\r");
+            chasing_setpoint = false;
+            invalidCommand = false;
+            break;
+        case 'D':
+            driveCommand_parseIndex = 1;
+            invalidCommand = false;
+            break;
+        case 'L':
+            if(!tuning_mode){
+                tuning_mode=true;
+                tuning_whichK = tuning_Kp;
+                GPIO_setOutputHighOnPin(GPIO_PORT_P2, GPIO_PIN0);
+                GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN1 | GPIO_PIN2);
+                printf(EUSCI_A0_BASE, "Entered Tuning Mode.\n\r");
+                Timer_A_startCounter(TIMER_A1_BASE, TIMER_A_UP_MODE);
+                chasing_setpoint = true;
+                tuning_AlternateSetpoint = TUNING_SETPOINT_B;
+                setpoint = TUNING_SETPOINT_A;
+            }else{
+                tuning_mode=false;
+                chasing_setpoint = false;
+                printf(EUSCI_A0_BASE, "Tuning Complete.\n\r");
+                Timer_A_stopTimer(TIMER_A1_BASE);
+                GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN0 | GPIO_PIN1 | GPIO_PIN2);
+            }
+            invalidCommand = false;
+            break;
+        case 'u':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE, "Not tuning.\n\r");
+            } else {
+                switch (tuning_whichK) {
+                    case tuning_Kp:
+                        tuning_whichK = tuning_Kd;
+                        GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN0);
+                        GPIO_setOutputHighOnPin(GPIO_PORT_P2, GPIO_PIN1);
+                        break;
+                    case tuning_Kd:
+                        tuning_whichK = tuning_Ki;
+                        GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN1);
+                        GPIO_setOutputHighOnPin(GPIO_PORT_P2, GPIO_PIN2);
+                        break;
+                    case tuning_Ki:
+                        tuning_whichK = tuning_Kp;
+                        GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN2);
+                        GPIO_setOutputHighOnPin(GPIO_PORT_P2, GPIO_PIN0);
+                        break;
+                }
+            }
+            break;
+        case 'r':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() -=100;
+            invalidCommand = false;
+            break;
+        case 't':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() -=100;
+            invalidCommand = false;
+            break;
+        case 'y':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() -=1;
+            invalidCommand = false;
+            break;
+        case 'i':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() +=1;
+            invalidCommand = false;
+            break;
+        case 'o':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() +=10;
+            invalidCommand = false;
+            break;
+        case 'p':
+            if(!tuning_mode){
+                printf(EUSCI_A0_BASE,"Not tuning.\n\r");
+                break;
+            }
+            *currentK() +=100;
+            invalidCommand = false;
+            break;
+        case '\n':
+        case '\r':
+            invalidCommand = false;
+            break;
+        }
+
+        if(invalidCommand){
+            printf(EUSCI_A0_BASE, "???\n\r");
+        }
+    }
+}
+
+void ADC14_IRQHandler(void)
 {
-	//printf("%x\t",P1OUT);
-	TA1CCTL0 &= ~CCIFG;  // Clearing the interrupt flag
-	TA1CTL   &= ~TAIFG;  // Clear TAIFG flag
+    uint32_t status;
 
-	// Control Logic
-	error = pos_d - pos;
+    status = ADC14->IFGR0;
+    ADC14->CLRIFGR0 = status;
 
-	error_d = (error-error_old)/dt;
-
-	u = Kp*error + Ki*error_i + Kd*error_d;
-
-	// Anti-windup
-	if(abs(u) >= 65535 && (((error >= 0) && (error_i >= 0)) || ((error < 0) && (error_i < 0))))
-	{
-		if(antiWindup)
-		{
-			error_i = error_i;
-		}
-		else  // If no antiwindup
-		{
-			error_i = error_i + dt*1*error;  // rectangular integration
-		}
-		//P1OUT &= ~BIT0;
-	}
-	else
-	{
-		error_i = error_i + dt*1*error;  // rectangular integration
-		//P1OUT |= BIT0;
-	}
-	error_old = error;
-	//printf("%i\t",error);
-	//printf("%i\n",u);
-
-	if(u>=0)
-	{
-		setDIR(0);
-		setPWM(abs(u));
-	}
-	else
-	{
-		setDIR(1);
-		setPWM(abs(u));
-	}
-
-	if(abs(u) < 65535)
-	{
-		//P1OUT &= ~BIT0;
-	}
-	else
-	{
-		//P1OUT |= BIT0;
-	}
-	//printf("%x\n",P1OUT);
+    if (status & ADC14_IER0_IE0)
+    {
+        current = ADC14->MEM[0]; //read result of conversion of A0 (right side motor current sensor)
+    }
 }
